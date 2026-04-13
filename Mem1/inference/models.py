@@ -30,8 +30,15 @@ class BaseClient(abc.ABC):
 
 class VLLMOpenAIClient(BaseClient):
     def __init__(self):
-        self.url = "http://localhost:8014"
-        self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B")
+        self.url = os.getenv("VLLM_BASE_URL", "http://localhost:8014")
+        self.default_tokenizer_name = os.getenv("VLLM_TOKENIZER_NAME", os.getenv("MODEL_PATH", "Qwen/Qwen3-8B"))
+        self._tokenizers = {}
+
+    def _get_tokenizer(self, model_name: Optional[str] = None):
+        tokenizer_name = os.getenv("VLLM_TOKENIZER_NAME") or model_name or self.default_tokenizer_name
+        if tokenizer_name not in self._tokenizers:
+            self._tokenizers[tokenizer_name] = AutoTokenizer.from_pretrained(tokenizer_name)
+        return self._tokenizers[tokenizer_name]
 
     def generate_response(self, prompt, model="gpt-4o", temperature=0.01, force_json=False):
         try:
@@ -63,10 +70,13 @@ class VLLMOpenAIClient(BaseClient):
     def make_completion(self, initial_prompt, content, model="gpt-4o", temperature=0.01, force_json=False, is_last_turn=False):
         prompt_message = [{"role": "user", "content": initial_prompt}]
         prompt_message.append({"role": "assistant", "content": content})
-        prompt_message = self.tokenizer.apply_chat_template(prompt_message, tokenize=False)
+        tokenizer = self._get_tokenizer(model)
+        prompt_message = tokenizer.apply_chat_template(prompt_message, tokenize=False)
 
-        # remove the <|im_end> at the end of the prompt
-        prompt_message = prompt_message[:-len("<|im_end|>\n")]
+        for suffix in ("<|im_end|>\n", "<|im_end|>", "<|eot_id|>\n", "<|eot_id|>"):
+            if prompt_message.endswith(suffix):
+                prompt_message = prompt_message[:-len(suffix)]
+                break
 
         stop = []
         if is_last_turn:

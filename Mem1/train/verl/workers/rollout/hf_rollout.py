@@ -68,33 +68,42 @@ class HFRollout(BaseRollout):
         response_length = prompts.meta_info.get('response_length', self.config.response_length)
         top_p = prompts.meta_info.get('top_p', self.config.get('top_p', 1.0))
         top_k = prompts.meta_info.get('top_k', self.config.get('top_k', 0))
+        temperature = prompts.meta_info.get('temperature', self.config.temperature)
 
         if top_k is None:
             top_k = 0
         top_k = max(0, top_k)  # to be compatible with vllm
 
-        temperature = prompts.meta_info.get('temperature', self.config.temperature)
+        generation_kwargs = dict(
+            input_ids=idx,
+            attention_mask=attention_mask,
+            do_sample=do_sample,
+            max_new_tokens=response_length,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            output_scores=False,
+            return_dict_in_generate=True,
+            use_cache=True,
+        )
 
-        generation_config = GenerationConfig(temperature=temperature, top_p=top_p, top_k=top_k)
+        if do_sample:
+            sampling_config = {}
+            if temperature is not None:
+                sampling_config['temperature'] = temperature
+            if top_p is not None:
+                sampling_config['top_p'] = top_p
+            if top_k is not None:
+                sampling_config['top_k'] = top_k
+            generation_kwargs['generation_config'] = GenerationConfig(**sampling_config)
+        else:
+            generation_kwargs['generation_config'] = GenerationConfig(do_sample=False)
 
         if isinstance(self.module, FSDP):
             # recurse need to set to False according to https://github.com/pytorch/pytorch/issues/100069
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                output = self.module.generate(
-                    input_ids=idx,
-                    attention_mask=attention_mask,
-                    do_sample=do_sample,
-                    max_new_tokens=response_length,
-                    # max_length=max_length,
-                    eos_token_id=eos_token_id,
-                    pad_token_id=pad_token_id,
-                    generation_config=generation_config,
-                    # renormalize_logits=True,
-                    output_scores=False,  # this is potentially very large
-                    return_dict_in_generate=True,
-                    use_cache=True)
+                output = self.module.generate(**generation_kwargs)
         # TODO: filter out the seq with no answers like ds-chat
         seq = output.sequences
 

@@ -1,0 +1,27 @@
+services:
+  mem1-qwen3:
+    image: mem1-qwen3:latest
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: mem1-qwen3
+    working_dir: /workspace/MEM1
+    environment:
+      CUDA_VISIBLE_DEVICES: "${CUDA_VISIBLE_DEVICES:-0}"
+      HF_HOME: /root/.cache/huggingface
+      HF_TOKEN: "${HF_TOKEN:-}"
+      WANDB_API_KEY: "${WANDB_API_KEY:-}"
+    volumes:
+      - .:/workspace/MEM1
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    command: >
+      bash -lc "sleep infinity"
+    tty: true
+    stdin_open: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_DEVICE_ID:-0}"]
+              capabilities: [gpu]

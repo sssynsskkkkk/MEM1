@@ -17,13 +17,14 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 from verl import DataProto
 import torch
-from verl.utils.reward_score import qa_em, websearch, qa_multiple
+from verl.utils.reward_score import countdown, game24, qa_em, qa_multiple
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 import re
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import os
+import importlib
 
 def _select_rm_score_fn(data_source):
     if data_source in ['nq', 'triviaqa', 'popqa', 'hotpotqa', '2wikimultihopqa', 'musique', 'bamboogle']:
@@ -32,7 +33,12 @@ def _select_rm_score_fn(data_source):
         # return qa_multiple.model_estimated_match_score
         # return qa_em.model_estimated_match_score
         # return websearch.compute_score_f1
+    elif data_source in ['countdown']:
+        return countdown.compute_score
+    elif data_source in ['game24', 'gameof24']:
+        return game24.compute_score
     elif data_source in ['websearch']:
+        websearch = importlib.import_module('verl.utils.reward_score.websearch')
         return websearch.compute_score_f1
     else:
         raise NotImplementedError
@@ -67,7 +73,7 @@ class RewardManager():
         ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 
         # select rm_score
-        data_source = data_item.non_tensor_batch['data_source']
+        data_source = data_item.non_tensor_batch.get('data_source', 'countdown')
         compute_score_fn = _select_rm_score_fn(data_source)
         try:
             format_rewards = data_item.batch['batch_rewards']
@@ -167,11 +173,14 @@ def main_task(config):
 
     from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
+    use_reference_policy = config.algorithm.get('use_reference_policy', True)
+
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
         Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker),
     }
+    if use_reference_policy:
+        role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
 
     global_pool_id = 'global_pool'
     resource_pool_spec = {
@@ -180,8 +189,9 @@ def main_task(config):
     mapping = {
         Role.ActorRollout: global_pool_id,
         Role.Critic: global_pool_id,
-        Role.RefPolicy: global_pool_id,
     }
+    if use_reference_policy:
+        mapping[Role.RefPolicy] = global_pool_id
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score

@@ -1,0 +1,9 @@
+transformers>=4.51.0
+accelerate
+datasets
+sentencepiece
+protobuf
+scipy
+sympy
+pandas
+tqdm

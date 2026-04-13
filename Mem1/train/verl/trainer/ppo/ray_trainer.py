@@ -41,7 +41,10 @@ from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 import re
-from rollout.llm_agent.generation_think import LLMGenerationManager, GenerationConfig
+from rollout.llm_agent.generation_game24 import GenerationConfig as Game24GenerationConfig
+from rollout.llm_agent.generation_game24 import LLMGenerationManager as Game24GenerationManager
+from rollout.llm_agent.generation_think import GenerationConfig as ThinkGenerationConfig
+from rollout.llm_agent.generation_think import LLMGenerationManager as ThinkGenerationManager
 
 WorkerType = Type[Worker]
 
@@ -289,6 +292,22 @@ def compute_data_metrics(batch, use_critic=True):
         metrics['env/ratio_of_valid_action'] = float((np.array(batch.meta_info['valid_action_stats'], dtype=np.int16) / np.array(batch.meta_info['turns_stats'], dtype=np.int16)).mean())
     if 'valid_search_stats' in batch.meta_info:
         metrics['env/number_of_valid_search'] = float(np.array(batch.meta_info['valid_search_stats'], dtype=np.int16).mean())
+    if 'success_stats' in batch.meta_info:
+        metrics['env/success_rate'] = float(np.array(batch.meta_info['success_stats'], dtype=np.float32).mean())
+    if 'invalid_action_counts' in batch.meta_info and 'generated_turns_stats' in batch.meta_info:
+        invalid_actions = np.array(batch.meta_info['invalid_action_counts'], dtype=np.float32).sum()
+        total_turns = np.array(batch.meta_info['generated_turns_stats'], dtype=np.float32).sum()
+        metrics['env/invalid_action_rate'] = float(invalid_actions / total_turns) if total_turns > 0 else 0.0
+    if 'format_valid_stats' in batch.meta_info and 'generated_turns_stats' in batch.meta_info:
+        compliant = np.array(batch.meta_info['format_valid_stats'], dtype=np.float32).sum()
+        total_turns = np.array(batch.meta_info['generated_turns_stats'], dtype=np.float32).sum()
+        metrics['env/format_compliance_rate'] = float(compliant / total_turns) if total_turns > 0 else 0.0
+    if 'summary_length_sums' in batch.meta_info and 'summary_count_stats' in batch.meta_info:
+        total_summary_len = np.array(batch.meta_info['summary_length_sums'], dtype=np.float32).sum()
+        total_summary_count = np.array(batch.meta_info['summary_count_stats'], dtype=np.float32).sum()
+        metrics['env/avg_summary_len'] = float(total_summary_len / total_summary_count) if total_summary_count > 0 else 0.0
+    if 'turns_stats' in batch.meta_info:
+        metrics['env/avg_steps'] = float(np.array(batch.meta_info['turns_stats'], dtype=np.float32).mean())
 
 
     return metrics
@@ -323,6 +342,137 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     with Timer(name=name, logger=None) as timer:
         yield
     timing_raw[name] = timer.last
+
+
+GAME24_SOURCES = {'game24', 'gameof24'}
+ROLLOUT_METRIC_KEYS = (
+    'success_stats',
+    'invalid_action_counts',
+    'turns_stats',
+    'retry_counts',
+    'summary_length_sums',
+    'summary_count_stats',
+    'format_valid_stats',
+    'generated_turns_stats',
+)
+
+
+def _extract_first_data_source(batch_like) -> str:
+    data_source = None
+    if hasattr(batch_like, 'non_tensor_batch'):
+        data_source = batch_like.non_tensor_batch.get('data_source', None)
+    elif isinstance(batch_like, dict):
+        data_source = batch_like.get('data_source', None)
+
+    if isinstance(data_source, np.ndarray):
+        if data_source.size == 0:
+            return 'unknown'
+        return str(data_source[0])
+    if isinstance(data_source, (list, tuple)):
+        if not data_source:
+            return 'unknown'
+        return str(data_source[0])
+    if data_source is None:
+        return 'unknown'
+    return str(data_source)
+
+
+def _is_game24_source(data_source: str) -> bool:
+    return str(data_source).lower() in GAME24_SOURCES
+
+
+def _extract_ground_truths(batch_like):
+    reward_models = batch_like.non_tensor_batch.get('reward_model', None)
+    if reward_models is None:
+        raise ValueError('reward_model ground truth is required for Game24 rollout')
+
+    if isinstance(reward_models, np.ndarray):
+        return [item['ground_truth'] for item in reward_models.tolist()]
+    if isinstance(reward_models, list):
+        return [item['ground_truth'] for item in reward_models]
+    raise TypeError(f'Unsupported reward_model container: {type(reward_models)}')
+
+
+def _append_rollout_metrics(store: Dict[str, list], meta_info: Dict):
+    for key in ROLLOUT_METRIC_KEYS:
+        if key in meta_info:
+            store.setdefault(key, []).append(np.asarray(meta_info[key], dtype=np.float32))
+
+
+def _aggregate_rollout_metrics(metric_dict: Dict[str, float], data_source: str, metric_store: Dict[str, list]):
+    if 'success_stats' in metric_store:
+        metric_dict[f'val/success_rate/{data_source}'] = float(np.concatenate(metric_store['success_stats']).mean())
+    if 'invalid_action_counts' in metric_store and 'generated_turns_stats' in metric_store:
+        invalid_actions = np.concatenate(metric_store['invalid_action_counts']).sum()
+        total_turns = np.concatenate(metric_store['generated_turns_stats']).sum()
+        metric_dict[f'val/invalid_action_rate/{data_source}'] = float(invalid_actions / total_turns) if total_turns > 0 else 0.0
+    if 'turns_stats' in metric_store:
+        metric_dict[f'val/avg_steps/{data_source}'] = float(np.concatenate(metric_store['turns_stats']).mean())
+    if 'summary_length_sums' in metric_store and 'summary_count_stats' in metric_store:
+        total_len = np.concatenate(metric_store['summary_length_sums']).sum()
+        total_count = np.concatenate(metric_store['summary_count_stats']).sum()
+        metric_dict[f'val/avg_summary_len/{data_source}'] = float(total_len / total_count) if total_count > 0 else 0.0
+    if 'format_valid_stats' in metric_store and 'generated_turns_stats' in metric_store:
+        compliant = np.concatenate(metric_store['format_valid_stats']).sum()
+        total_turns = np.concatenate(metric_store['generated_turns_stats']).sum()
+        metric_dict[f'val/format_compliance_rate/{data_source}'] = float(compliant / total_turns) if total_turns > 0 else 0.0
+
+
+def _decode_token_rows(tokenizer, token_tensor: torch.Tensor) -> list[str]:
+    decoded = []
+    pad_token_id = tokenizer.pad_token_id
+    for row in token_tensor:
+        valid = row[row != pad_token_id]
+        decoded.append(tokenizer.decode(valid, skip_special_tokens=True))
+    return decoded
+
+
+def _build_eval_dump_rows(tokenizer, batch: DataProto, reward_tensor: torch.Tensor, meta_info: Dict, global_step: int):
+    prompt_texts = _decode_token_rows(tokenizer, batch.batch['prompts']) if 'prompts' in batch.batch else []
+    trajectory_texts = _decode_token_rows(tokenizer, batch.batch['responses']) if 'responses' in batch.batch else []
+    sample_rewards = reward_tensor.sum(-1).detach().cpu().tolist()
+    data_sources = batch.non_tensor_batch.get('data_source', ['unknown'] * len(sample_rewards))
+    extra_infos = batch.non_tensor_batch.get('extra_info', [None] * len(sample_rewards))
+
+    if isinstance(data_sources, np.ndarray):
+        data_sources = data_sources.tolist()
+    if isinstance(extra_infos, np.ndarray):
+        extra_infos = extra_infos.tolist()
+
+    success_stats = meta_info.get('success_stats', [None] * len(sample_rewards))
+    invalid_action_counts = meta_info.get('invalid_action_counts', [None] * len(sample_rewards))
+    turns_stats = meta_info.get('turns_stats', [None] * len(sample_rewards))
+    retry_counts = meta_info.get('retry_counts', [None] * len(sample_rewards))
+    format_valid_stats = meta_info.get('format_valid_stats', [None] * len(sample_rewards))
+    generated_turns_stats = meta_info.get('generated_turns_stats', [None] * len(sample_rewards))
+    summary_length_sums = meta_info.get('summary_length_sums', [None] * len(sample_rewards))
+    summary_count_stats = meta_info.get('summary_count_stats', [None] * len(sample_rewards))
+
+    rows = []
+    for idx, reward in enumerate(sample_rewards):
+        summary_count = summary_count_stats[idx] if idx < len(summary_count_stats) else None
+        summary_len_sum = summary_length_sums[idx] if idx < len(summary_length_sums) else None
+        avg_summary_len = None
+        if summary_count not in (None, 0) and summary_len_sum is not None:
+            avg_summary_len = float(summary_len_sum) / float(summary_count)
+
+        rows.append({
+            'global_step': global_step,
+            'sample_index_in_batch': idx,
+            'data_source': str(data_sources[idx]) if idx < len(data_sources) else 'unknown',
+            'extra_info': extra_infos[idx] if idx < len(extra_infos) else None,
+            'prompt_text': prompt_texts[idx] if idx < len(prompt_texts) else '',
+            'trajectory_text': trajectory_texts[idx] if idx < len(trajectory_texts) else '',
+            'reward': float(reward),
+            'success': int(success_stats[idx]) if idx < len(success_stats) and success_stats[idx] is not None else None,
+            'invalid_action_count': int(invalid_action_counts[idx]) if idx < len(invalid_action_counts) and invalid_action_counts[idx] is not None else None,
+            'turn_count': int(turns_stats[idx]) if idx < len(turns_stats) and turns_stats[idx] is not None else None,
+            'retry_count': int(retry_counts[idx]) if idx < len(retry_counts) and retry_counts[idx] is not None else None,
+            'format_valid_turns': int(format_valid_stats[idx]) if idx < len(format_valid_stats) and format_valid_stats[idx] is not None else None,
+            'generated_turns': int(generated_turns_stats[idx]) if idx < len(generated_turns_stats) and generated_turns_stats[idx] is not None else None,
+            'avg_summary_len': avg_summary_len,
+        })
+    return rows
 
 
 class RayPPOTrainer(object):
@@ -449,6 +599,65 @@ class RayPPOTrainer(object):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
 
+    def _build_generation_manager(self, data_source: str, is_validation: bool = False):
+        if _is_game24_source(data_source):
+            game24_cfg = self.config.get('game24', {})
+            gen_config = Game24GenerationConfig(
+                max_turns=self.config.max_turns,
+                max_start_length=self.config.data.max_start_length,
+                max_prompt_length=self.config.data.max_prompt_length,
+                max_response_length=self.config.data.max_response_length,
+                max_obs_length=self.config.data.max_obs_length,
+                num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
+                require_reasoning=game24_cfg.get('require_reasoning', True),
+                format_reward=game24_cfg.get('format_reward', 0.0),
+                summary_present_reward=game24_cfg.get('summary_present_reward', 0.0),
+                valid_action_reward=game24_cfg.get('valid_action_reward', 0.0),
+                invalid_action_penalty=game24_cfg.get('invalid_action_penalty', -0.25),
+                step_penalty=game24_cfg.get('step_penalty', 0.0),
+                unparsable_output_penalty=game24_cfg.get('unparsable_output_penalty', -0.05),
+                value_tolerance=game24_cfg.get('value_tolerance', 1e-5),
+            )
+            return Game24GenerationManager(
+                tokenizer=self.tokenizer,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+                is_validation=is_validation,
+            )
+
+        gen_config = ThinkGenerationConfig(
+            max_turns=self.config.max_turns,
+            max_start_length=self.config.data.max_start_length,
+            max_prompt_length=self.config.data.max_prompt_length,
+            max_response_length=self.config.data.max_response_length,
+            max_obs_length=self.config.data.max_obs_length,
+            num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
+            no_think_rl=self.config.algorithm.no_think_rl,
+            search_url=self.config.retriever.url,
+            topk=self.config.retriever.topk,
+        )
+        return ThinkGenerationManager(
+            tokenizer=self.tokenizer,
+            actor_rollout_wg=self.actor_rollout_wg,
+            config=gen_config,
+            is_validation=is_validation,
+        )
+
+    def _run_generation_loop(self, generation_manager, gen_batch: DataProto, batch_like, timing_raw=None):
+        first_input_ids = gen_batch.batch['input_ids'][:, -generation_manager.config.max_start_length:].clone().long()
+        if timing_raw is not None:
+            generation_manager.timing_raw = timing_raw
+
+        kwargs = {}
+        if getattr(generation_manager, 'requires_ground_truths', False):
+            kwargs['ground_truths'] = _extract_ground_truths(batch_like)
+
+        return generation_manager.run_llm_loop(
+            gen_batch=gen_batch,
+            initial_input_ids=first_input_ids,
+            **kwargs,
+        )
+
     def _validate(self):
         """
         The training loop of PPO with global metric computation.
@@ -457,26 +666,10 @@ class RayPPOTrainer(object):
         import torch
         reward_tensor_lst = []
         data_source_lst = []
-
-        gen_config = GenerationConfig(
-            max_turns=self.config.max_turns,
-            max_start_length=self.config.data.max_start_length,
-            max_prompt_length=self.config.data.max_prompt_length,
-            max_response_length=self.config.data.max_response_length,
-            max_obs_length=self.config.data.max_obs_length,
-            num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
-            no_think_rl=self.config.algorithm.no_think_rl,
-            search_url = self.config.retriever.url,
-            topk = self.config.retriever.topk,
-        )
-
-        # Agent config preparation
-        generation_manager = LLMGenerationManager(
-            tokenizer=self.tokenizer,
-            actor_rollout_wg=self.actor_rollout_wg,
-            config=gen_config,
-            is_validation = True,
-        )
+        generation_managers = {}
+        rollout_metric_store = {}
+        eval_dump_dir = self.config.trainer.get('eval_dump_dir', None)
+        eval_dump_rows = []
 
         if not self.config.do_search:
             for test_data in self.val_dataloader:
@@ -515,6 +708,11 @@ class RayPPOTrainer(object):
                 timing_raw = {}
                 test_batch: DataProto = DataProto.from_single_dict(batch_dict)
                 # test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
+                data_source = _extract_first_data_source(test_batch)
+                generation_manager = generation_managers.get(data_source)
+                if generation_manager is None:
+                    generation_manager = self._build_generation_manager(data_source, is_validation=True)
+                    generation_managers[data_source] = generation_manager
                 
                 test_gen_batch = test_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
                 test_gen_batch.meta_info = {
@@ -525,12 +723,12 @@ class RayPPOTrainer(object):
                     'validate': True,
                 }
                 with _timer('step', timing_raw):
-                    first_input_ids = test_gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
                     with _timer('gen', timing_raw):
-                        generation_manager.timing_raw = timing_raw
-                        final_gen_batch_output = generation_manager.run_llm_loop(
-                            gen_batch=test_gen_batch,
-                            initial_input_ids=first_input_ids,
+                        final_gen_batch_output = self._run_generation_loop(
+                            generation_manager,
+                            test_gen_batch,
+                            test_batch,
+                            timing_raw=timing_raw,
                         )
                     
                     test_batch = test_batch.union(final_gen_batch_output)
@@ -547,6 +745,18 @@ class RayPPOTrainer(object):
 
                     reward_tensor_lst.append(reward_tensor)
                     data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                    source_store = rollout_metric_store.setdefault(data_source, {})
+                    _append_rollout_metrics(source_store, final_gen_batch_output.meta_info)
+                    if eval_dump_dir:
+                        eval_dump_rows.extend(
+                            _build_eval_dump_rows(
+                                tokenizer=self.tokenizer,
+                                batch=test_batch,
+                                reward_tensor=reward_tensor,
+                                meta_info=final_gen_batch_output.meta_info,
+                                global_step=self.global_steps,
+                            )
+                        )
 
         reward_tensor = torch.cat([rw.sum(-1) for rw in reward_tensor_lst], dim=0).cpu()  # (batch_size,)
         # reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
@@ -562,6 +772,16 @@ class RayPPOTrainer(object):
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+            if data_source in rollout_metric_store:
+                _aggregate_rollout_metrics(metric_dict, data_source, rollout_metric_store[data_source])
+
+        if eval_dump_dir and eval_dump_rows:
+            os.makedirs(eval_dump_dir, exist_ok=True)
+            dump_path = os.path.join(eval_dump_dir, f'val_step_{self.global_steps}.jsonl')
+            with open(dump_path, 'w', encoding='utf-8') as handle:
+                for row in eval_dump_rows:
+                    handle.write(json.dumps(row, ensure_ascii=False) + '\n')
+            metric_dict['val/dump_rows'] = len(eval_dump_rows)
 
         return metric_dict
 
@@ -691,25 +911,7 @@ class RayPPOTrainer(object):
 
         # we start from step 1
         self.global_steps += 1
-
-        # Agent config preparation
-        gen_config = GenerationConfig(
-            max_turns=self.config.max_turns,
-            max_start_length=self.config.data.max_start_length,
-            max_prompt_length=self.config.data.max_prompt_length,
-            max_response_length=self.config.data.max_response_length,
-            max_obs_length=self.config.data.max_obs_length,
-            num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
-            no_think_rl=self.config.algorithm.no_think_rl,
-            search_url = self.config.retriever.url,
-            topk = self.config.retriever.topk,
-        )
-
-        generation_manager = LLMGenerationManager(
-            tokenizer=self.tokenizer,
-            actor_rollout_wg=self.actor_rollout_wg,
-            config=gen_config,
-        )
+        generation_managers = {}
 
         # start training loop
         for epoch in range(self.config.trainer.total_epochs):
@@ -742,16 +944,18 @@ class RayPPOTrainer(object):
                 ####################
                 # with _timer('step', timing_raw):
                     else:
-
-                        # import pdb; pdb.set_trace()
-
-                        first_input_ids = gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone().long()
+                        data_source = _extract_first_data_source(batch)
+                        generation_manager = generation_managers.get(data_source)
+                        if generation_manager is None:
+                            generation_manager = self._build_generation_manager(data_source, is_validation=False)
+                            generation_managers[data_source] = generation_manager
 
                         with _timer('gen', timing_raw):
-                            generation_manager.timing_raw = timing_raw
-                            final_gen_batch_output = generation_manager.run_llm_loop(
-                                gen_batch=gen_batch,
-                                initial_input_ids=first_input_ids,
+                            final_gen_batch_output = self._run_generation_loop(
+                                generation_manager,
+                                gen_batch,
+                                batch,
+                                timing_raw=timing_raw,
                             )
 
                         # final_gen_batch_output.batch.apply(lambda x: x.long(), inplace=True)
