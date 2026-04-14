@@ -193,6 +193,20 @@ def analyze_response(raw_response, numbers):
     }
 
 
+def select_env_parse_view(metrics, env_parse_mode):
+    if env_parse_mode == "raw":
+        prefix = "raw"
+    else:
+        prefix = "stripped"
+    return {
+        "parse_ok": metrics[f"{prefix}_env_format_ok"],
+        "summary_text": metrics[f"{prefix}_summary_text"],
+        "action_text": metrics[f"{prefix}_action_text"],
+        "action_valid": metrics[f"{prefix}_action_valid"],
+        "action_error": metrics[f"{prefix}_action_error"],
+    }
+
+
 def write_json(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -341,6 +355,7 @@ def evaluate_env_model(model_id, problems, args):
 
     outcome_counts = {key: 0 for key in PREVIOUS_RESULT_KEYS}
     generated_turns = 0
+    selected_env_parse_turns = 0
     raw_env_parse_turns = 0
     stripped_env_parse_turns = 0
     think_strip_helped_turns = 0
@@ -382,15 +397,18 @@ def evaluate_env_model(model_id, problems, args):
                 stripped_env_parse_turns += 1
             if metrics["think_strip_helped"]:
                 think_strip_helped_turns += 1
+            selected_view = select_env_parse_view(metrics, args.env_parse_mode)
+            if selected_view["parse_ok"]:
+                selected_env_parse_turns += 1
 
             turn_outcome = "retry_unparsable_output"
             done = False
 
-            if metrics["stripped_env_format_ok"]:
-                if metrics["stripped_action_valid"]:
+            if selected_view["parse_ok"]:
+                if selected_view["action_valid"]:
                     valid_action_turns += 1
-                    carried_summary_block = f"<summary>{metrics['stripped_summary_text']}</summary>"
-                    action_outcome = apply_action_to_state(current_state, metrics["stripped_action_text"], tolerance=1e-5)
+                    carried_summary_block = f"<summary>{selected_view['summary_text']}</summary>"
+                    action_outcome = apply_action_to_state(current_state, selected_view["action_text"], tolerance=1e-5)
                     current_state = action_outcome.next_state
                     steps_in_attempt += 1
 
@@ -412,9 +430,9 @@ def evaluate_env_model(model_id, problems, args):
                     else:
                         turn_outcome = "continue"
                 else:
-                    if metrics["stripped_summary_text"]:
-                        carried_summary_block = f"<summary>{metrics['stripped_summary_text']}</summary>"
-                    turn_outcome = f"retry_invalid_action:{metrics['stripped_action_error']}"
+                    if selected_view["summary_text"]:
+                        carried_summary_block = f"<summary>{selected_view['summary_text']}</summary>"
+                    turn_outcome = f"retry_invalid_action:{selected_view['action_error']}"
                     retry_count += 1
                     current_state = list(initial_state)
                     steps_in_attempt = 0
@@ -453,10 +471,10 @@ def evaluate_env_model(model_id, problems, args):
             solved_samples += 1
 
         if sample_idx % args.log_every == 0 or sample_idx == len(problems):
-            stripped_rate = (stripped_env_parse_turns / generated_turns) * 100 if generated_turns else 0.0
+            selected_rate = (selected_env_parse_turns / generated_turns) * 100 if generated_turns else 0.0
             print(
                 f"[{model_id}] env {sample_idx}/{len(problems)} | "
-                f"stripped env parse turns: {stripped_rate:.2f}%"
+                f"{args.env_parse_mode} env parse turns: {selected_rate:.2f}%"
             )
 
     duration_sec = time.time() - started_at
@@ -467,6 +485,8 @@ def evaluate_env_model(model_id, problems, args):
 
     return {
         "model_id": model_id,
+        "env_parse_mode": args.env_parse_mode,
+        "selected_env_parse_turn_rate": selected_env_parse_turns / generated_turns if generated_turns else 0.0,
         "raw_env_parse_turn_rate": raw_env_parse_turns / generated_turns if generated_turns else 0.0,
         "stripped_env_parse_turn_rate": stripped_env_parse_turns / generated_turns if generated_turns else 0.0,
         "think_strip_helped_turn_rate": think_strip_helped_turns / generated_turns if generated_turns else 0.0,
@@ -498,6 +518,7 @@ def parse_args():
     parser.add_argument("--format-max-new-tokens", type=int, default=256)
     parser.add_argument("--env-max-new-tokens", type=int, default=160)
     parser.add_argument("--env-max-turns", type=int, default=3)
+    parser.add_argument("--env-parse-mode", choices=["raw", "strip_think"], default="raw")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--torch-dtype", default="auto")
     parser.add_argument("--log-every", type=int, default=10)
@@ -527,6 +548,7 @@ def main():
     print(f"Dataset: {args.dataset} ({args.split})")
     print(f"Shared samples: {len(problems)}")
     print(f"prepend_no_think: {args.prepend_no_think}")
+    print(f"env_parse_mode: {args.env_parse_mode}")
 
     format_results = []
     env_results = []
@@ -550,6 +572,7 @@ def main():
         "shared_samples": len(problems),
         "seed": args.seed,
         "prepend_no_think": args.prepend_no_think,
+        "env_parse_mode": args.env_parse_mode,
         "results": env_results,
     }
 
@@ -577,6 +600,7 @@ def main():
     for row in env_results:
         print(
             f"Model: {row['model_id']} | "
+            f"selected_parse_turn={row['selected_env_parse_turn_rate'] * 100:.1f}% | "
             f"raw_parse_turn={row['raw_env_parse_turn_rate'] * 100:.1f}% | "
             f"stripped_parse_turn={row['stripped_env_parse_turn_rate'] * 100:.1f}% | "
             f"retry_unparsable={row['retry_unparsable_output_rate'] * 100:.1f}% | "
