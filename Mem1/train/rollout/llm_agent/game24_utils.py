@@ -4,9 +4,12 @@ from fractions import Fraction
 from typing import Any, Dict, List, Optional, Sequence
 
 
+REASONING_TAG_RE = r"(?:<reasoning>.*?</reasoning>|<think>.*?</think>)"
+
+
 STRICT_OUTPUT_RE = re.compile(
     r"^\s*"
-    r"(?P<reasoning><reasoning>.*?</reasoning>)\s*"
+    rf"(?P<reasoning>{REASONING_TAG_RE})\s*"
     r"(?P<summary><summary>.*?</summary>)\s*"
     r"(?P<action><action>.*?</action>)\s*$",
     re.DOTALL,
@@ -14,7 +17,7 @@ STRICT_OUTPUT_RE = re.compile(
 
 NO_REASONING_OUTPUT_RE = re.compile(
     r"^\s*"
-    r"(?:(?P<reasoning><reasoning>.*?</reasoning>)\s*)?"
+    rf"(?:(?P<reasoning>{REASONING_TAG_RE})\s*)?"
     r"(?P<summary><summary>.*?</summary>)\s*"
     r"(?P<action><action>.*?</action>)\s*$",
     re.DOTALL,
@@ -22,6 +25,7 @@ NO_REASONING_OUTPUT_RE = re.compile(
 
 TAG_CONTENT_RE = {
     "reasoning": re.compile(r"<reasoning>(.*?)</reasoning>", re.DOTALL),
+    "think": re.compile(r"<think>(.*?)</think>", re.DOTALL),
     "summary": re.compile(r"<summary>(.*?)</summary>", re.DOTALL),
     "action": re.compile(r"<action>(.*?)</action>", re.DOTALL),
 }
@@ -96,6 +100,23 @@ def extract_tag_block(tag: str, text: str) -> str:
     return f"<{tag}>{inner}</{tag}>"
 
 
+def extract_reasoning_text(text: str) -> str:
+    reasoning_text = extract_tag_text("reasoning", text)
+    if reasoning_text:
+        return reasoning_text
+    return extract_tag_text("think", text)
+
+
+def extract_reasoning_block(text: str) -> str:
+    reasoning_match = TAG_CONTENT_RE["reasoning"].search(text)
+    if reasoning_match:
+        return reasoning_match.group(0).strip()
+    think_match = TAG_CONTENT_RE["think"].search(text)
+    if think_match:
+        return think_match.group(0).strip()
+    return ""
+
+
 def parse_model_output(text: str, require_reasoning: bool = True) -> ParsedOutput:
     trimmed = truncate_after_action(text)
     pattern = STRICT_OUTPUT_RE if require_reasoning else NO_REASONING_OUTPUT_RE
@@ -108,7 +129,7 @@ def parse_model_output(text: str, require_reasoning: bool = True) -> ParsedOutpu
         return ParsedOutput(
             raw_text=trimmed,
             format_ok=True,
-            reasoning_text=extract_tag_text("reasoning", reasoning_block) if reasoning_block else "",
+            reasoning_text=extract_reasoning_text(reasoning_block) if reasoning_block else "",
             summary_text=extract_tag_text("summary", summary_block),
             action_text=extract_tag_text("action", action_block),
             reasoning_block=reasoning_block,
@@ -119,10 +140,10 @@ def parse_model_output(text: str, require_reasoning: bool = True) -> ParsedOutpu
     return ParsedOutput(
         raw_text=trimmed,
         format_ok=False,
-        reasoning_text=extract_tag_text("reasoning", trimmed),
+        reasoning_text=extract_reasoning_text(trimmed),
         summary_text=extract_tag_text("summary", trimmed),
         action_text=extract_tag_text("action", trimmed),
-        reasoning_block=extract_tag_block("reasoning", trimmed),
+        reasoning_block=extract_reasoning_block(trimmed),
         summary_block=extract_tag_block("summary", trimmed),
         action_block=extract_tag_block("action", trimmed),
     )

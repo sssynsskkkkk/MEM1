@@ -610,6 +610,7 @@ class RayPPOTrainer(object):
                 max_obs_length=self.config.data.max_obs_length,
                 num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
                 require_reasoning=game24_cfg.get('require_reasoning', True),
+                prepend_no_think=self.config.algorithm.no_think_rl,
                 format_reward=game24_cfg.get('format_reward', 0.0),
                 summary_present_reward=game24_cfg.get('summary_present_reward', 0.0),
                 valid_action_reward=game24_cfg.get('valid_action_reward', 0.0),

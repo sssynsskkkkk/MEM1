@@ -18,6 +18,7 @@ class GenerationConfig:
     max_obs_length: int
     num_gpus: int
     require_reasoning: bool = True
+    prepend_no_think: bool = False
     format_reward: float = 0.0
     summary_present_reward: float = 0.0
     valid_action_reward: float = 0.0
@@ -214,6 +215,14 @@ class LLMGenerationManager:
         final_output.meta_info.update(meta_info)
         return final_output
 
+    def _maybe_prepend_no_think(self, prompt_text: str) -> str:
+        if not self.config.prepend_no_think:
+            return prompt_text
+        stripped = prompt_text.lstrip()
+        if stripped.startswith("/no_think"):
+            return prompt_text
+        return f"/no_think\n{stripped}"
+
     def _build_state_block(
         self,
         state,
@@ -254,11 +263,32 @@ class LLMGenerationManager:
         }
 
         batch_size = gen_batch.batch["input_ids"].shape[0]
+        original_meta_info = dict(gen_batch.meta_info)
         base_prompt_texts = []
+        prompt_texts_changed = False
         for i in range(batch_size):
             row = initial_input_ids[i]
             mask = row != self.tokenizer.pad_token_id
-            base_prompt_texts.append(self.tokenizer.decode(row[mask], skip_special_tokens=True))
+            decoded_prompt = self.tokenizer.decode(row[mask], skip_special_tokens=True)
+            adjusted_prompt = self._maybe_prepend_no_think(decoded_prompt)
+            if adjusted_prompt != decoded_prompt:
+                prompt_texts_changed = True
+            base_prompt_texts.append(adjusted_prompt)
+
+        if prompt_texts_changed:
+            initial_input_ids = self._batch_tokenize(base_prompt_texts)
+            if initial_input_ids.shape[1] > self.config.max_prompt_length:
+                initial_input_ids = initial_input_ids[:, -self.config.max_prompt_length :]
+            initial_attention_mask = self.tensor_fn.create_attention_mask(initial_input_ids)
+            initial_position_ids = self.tensor_fn.create_position_ids(initial_attention_mask)
+            gen_batch = DataProto.from_dict(
+                {
+                    "input_ids": initial_input_ids,
+                    "attention_mask": initial_attention_mask,
+                    "position_ids": initial_position_ids,
+                }
+            )
+            gen_batch.meta_info.update(original_meta_info)
 
         specs = [extract_puzzle_spec(item) for item in ground_truths]
         active_mask = torch.ones(batch_size, dtype=torch.bool)
