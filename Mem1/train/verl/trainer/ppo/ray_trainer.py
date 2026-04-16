@@ -43,6 +43,8 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 import re
 from rollout.llm_agent.generation_game24 import GenerationConfig as Game24GenerationConfig
 from rollout.llm_agent.generation_game24 import LLMGenerationManager as Game24GenerationManager
+from rollout.llm_agent.generation_maze import GenerationConfig as MazeGenerationConfig
+from rollout.llm_agent.generation_maze import LLMGenerationManager as MazeGenerationManager
 from rollout.llm_agent.generation_think import GenerationConfig as ThinkGenerationConfig
 from rollout.llm_agent.generation_think import LLMGenerationManager as ThinkGenerationManager
 
@@ -345,15 +347,20 @@ def _timer(name: str, timing_raw: Dict[str, float]):
 
 
 GAME24_SOURCES = {'game24', 'gameof24'}
+MAZE_SOURCES = {'maze', 'maze_mem1'}
 ROLLOUT_METRIC_KEYS = (
     'success_stats',
     'invalid_action_counts',
+    'blocked_move_counts',
     'turns_stats',
     'retry_counts',
     'summary_length_sums',
     'summary_count_stats',
     'format_valid_stats',
     'generated_turns_stats',
+    'unique_cells_visited_stats',
+    'solved_path_ratio_sums',
+    'solved_path_ratio_counts',
 )
 
 
@@ -381,6 +388,10 @@ def _is_game24_source(data_source: str) -> bool:
     return str(data_source).lower() in GAME24_SOURCES
 
 
+def _is_maze_source(data_source: str) -> bool:
+    return str(data_source).lower() in MAZE_SOURCES
+
+
 def _extract_ground_truths(batch_like):
     reward_models = batch_like.non_tensor_batch.get('reward_model', None)
     if reward_models is None:
@@ -406,6 +417,12 @@ def _aggregate_rollout_metrics(metric_dict: Dict[str, float], data_source: str, 
         invalid_actions = np.concatenate(metric_store['invalid_action_counts']).sum()
         total_turns = np.concatenate(metric_store['generated_turns_stats']).sum()
         metric_dict[f'val/invalid_action_rate/{data_source}'] = float(invalid_actions / total_turns) if total_turns > 0 else 0.0
+    if 'blocked_move_counts' in metric_store and 'generated_turns_stats' in metric_store:
+        blocked_moves = np.concatenate(metric_store['blocked_move_counts']).sum()
+        total_turns = np.concatenate(metric_store['generated_turns_stats']).sum()
+        blocked_move_rate = float(blocked_moves / total_turns) if total_turns > 0 else 0.0
+        metric_dict[f'val/blocked_move_rate/{data_source}'] = blocked_move_rate
+        metric_dict[f'val/invalid_move_rate/{data_source}'] = blocked_move_rate
     if 'turns_stats' in metric_store:
         metric_dict[f'val/avg_steps/{data_source}'] = float(np.concatenate(metric_store['turns_stats']).mean())
     if 'summary_length_sums' in metric_store and 'summary_count_stats' in metric_store:
@@ -416,6 +433,14 @@ def _aggregate_rollout_metrics(metric_dict: Dict[str, float], data_source: str, 
         compliant = np.concatenate(metric_store['format_valid_stats']).sum()
         total_turns = np.concatenate(metric_store['generated_turns_stats']).sum()
         metric_dict[f'val/format_compliance_rate/{data_source}'] = float(compliant / total_turns) if total_turns > 0 else 0.0
+    if 'unique_cells_visited_stats' in metric_store:
+        metric_dict[f'val/avg_unique_cells_visited/{data_source}'] = float(
+            np.concatenate(metric_store['unique_cells_visited_stats']).mean()
+        )
+    if 'solved_path_ratio_sums' in metric_store and 'solved_path_ratio_counts' in metric_store:
+        ratio_sum = np.concatenate(metric_store['solved_path_ratio_sums']).sum()
+        ratio_count = np.concatenate(metric_store['solved_path_ratio_counts']).sum()
+        metric_dict[f'val/solved_step_ratio/{data_source}'] = float(ratio_sum / ratio_count) if ratio_count > 0 else 0.0
 
 
 def _decode_token_rows(tokenizer, token_tensor: torch.Tensor) -> list[str]:
@@ -447,6 +472,10 @@ def _build_eval_dump_rows(tokenizer, batch: DataProto, reward_tensor: torch.Tens
     generated_turns_stats = meta_info.get('generated_turns_stats', [None] * len(sample_rewards))
     summary_length_sums = meta_info.get('summary_length_sums', [None] * len(sample_rewards))
     summary_count_stats = meta_info.get('summary_count_stats', [None] * len(sample_rewards))
+    blocked_move_counts = meta_info.get('blocked_move_counts', [None] * len(sample_rewards))
+    unique_cells_visited_stats = meta_info.get('unique_cells_visited_stats', [None] * len(sample_rewards))
+    solved_path_ratio_sums = meta_info.get('solved_path_ratio_sums', [None] * len(sample_rewards))
+    solved_path_ratio_counts = meta_info.get('solved_path_ratio_counts', [None] * len(sample_rewards))
 
     rows = []
     for idx, reward in enumerate(sample_rewards):
@@ -455,6 +484,11 @@ def _build_eval_dump_rows(tokenizer, batch: DataProto, reward_tensor: torch.Tens
         avg_summary_len = None
         if summary_count not in (None, 0) and summary_len_sum is not None:
             avg_summary_len = float(summary_len_sum) / float(summary_count)
+        solved_ratio = None
+        solved_ratio_count = solved_path_ratio_counts[idx] if idx < len(solved_path_ratio_counts) else None
+        solved_ratio_sum = solved_path_ratio_sums[idx] if idx < len(solved_path_ratio_sums) else None
+        if solved_ratio_count not in (None, 0) and solved_ratio_sum is not None:
+            solved_ratio = float(solved_ratio_sum) / float(solved_ratio_count)
 
         rows.append({
             'global_step': global_step,
@@ -471,6 +505,9 @@ def _build_eval_dump_rows(tokenizer, batch: DataProto, reward_tensor: torch.Tens
             'format_valid_turns': int(format_valid_stats[idx]) if idx < len(format_valid_stats) and format_valid_stats[idx] is not None else None,
             'generated_turns': int(generated_turns_stats[idx]) if idx < len(generated_turns_stats) and generated_turns_stats[idx] is not None else None,
             'avg_summary_len': avg_summary_len,
+            'blocked_move_count': int(blocked_move_counts[idx]) if idx < len(blocked_move_counts) and blocked_move_counts[idx] is not None else None,
+            'unique_cells_visited': int(unique_cells_visited_stats[idx]) if idx < len(unique_cells_visited_stats) and unique_cells_visited_stats[idx] is not None else None,
+            'solved_step_ratio': solved_ratio,
         })
     return rows
 
@@ -600,6 +637,29 @@ class RayPPOTrainer(object):
             self.config.critic.optim.total_training_steps = total_training_steps
 
     def _build_generation_manager(self, data_source: str, is_validation: bool = False):
+        if _is_maze_source(data_source):
+            maze_cfg = self.config.get('maze', {})
+            gen_config = MazeGenerationConfig(
+                max_turns=self.config.max_turns,
+                max_start_length=self.config.data.max_start_length,
+                max_prompt_length=self.config.data.max_prompt_length,
+                max_response_length=self.config.data.max_response_length,
+                max_obs_length=self.config.data.max_obs_length,
+                num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
+                require_reasoning=maze_cfg.get('require_reasoning', False),
+                prepend_no_think=self.config.algorithm.no_think_rl,
+                format_reward=maze_cfg.get('format_reward', 0.0),
+                summary_present_reward=maze_cfg.get('summary_present_reward', 0.0),
+                invalid_action_penalty=maze_cfg.get('invalid_action_penalty', 0.0),
+                unparsable_output_penalty=maze_cfg.get('unparsable_output_penalty', 0.0),
+            )
+            return MazeGenerationManager(
+                tokenizer=self.tokenizer,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+                is_validation=is_validation,
+            )
+
         if _is_game24_source(data_source):
             game24_cfg = self.config.get('game24', {})
             gen_config = Game24GenerationConfig(

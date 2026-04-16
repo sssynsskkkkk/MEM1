@@ -19,7 +19,7 @@ The input is a parquet file that contains N generated sequences and (optional) t
 
 import hydra
 from verl.utils.fs import copy_local_path_from_hdfs
-from verl.utils.reward_score import math, gsm8k
+from verl.utils.reward_score import math, maze
 import pandas as pd
 import numpy as np
 
@@ -27,6 +27,8 @@ import numpy as np
 def select_reward_fn(data_source):
     if data_source == 'lighteval/MATH':
         return math.compute_score
+    if data_source in ['maze', 'maze_mem1']:
+        return maze.compute_score
     else:
         raise NotImplementedError
 

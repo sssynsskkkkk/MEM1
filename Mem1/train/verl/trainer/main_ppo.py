@@ -17,7 +17,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 from verl import DataProto
 import torch
-from verl.utils.reward_score import countdown, game24, qa_em, qa_multiple
+from verl.utils.reward_score import countdown, game24, maze, qa_em, qa_multiple
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 import re
 import numpy as np
@@ -37,6 +37,8 @@ def _select_rm_score_fn(data_source):
         return countdown.compute_score
     elif data_source in ['game24', 'gameof24']:
         return game24.compute_score
+    elif data_source in ['maze', 'maze_mem1']:
+        return maze.compute_score
     elif data_source in ['websearch']:
         websearch = importlib.import_module('verl.utils.reward_score.websearch')
         return websearch.compute_score_f1
